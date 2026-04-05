@@ -3,10 +3,14 @@
 import { useEffect, useRef, useState, useImperativeHandle } from "react";
 import Script from "next/script";
 
-const Emulator = ({ commandRef, onUpdateIcons, onOpenFile }) => {
+const Emulator = ({ commandRef, onUpdateIcons, onOpenFile, onTicTacToeState }) => {
   const screenRef = useRef(null);
-  const processedFilesRef = useRef(new Set()); // Memory for GUI icons
-  const readCountRef = useRef(0); //Memory for file opening!
+  
+  // Track how many GUI blocks and Notepad blocks we've seen
+  const guiCountRef = useRef(0); 
+  const readCountRef = useRef(0); 
+  const tttCountRef = useRef(0); 
+  
   const [isLibraryLoaded, setIsLibraryLoaded] = useState(
     typeof window !== "undefined" && !!window.V86
   );
@@ -18,6 +22,11 @@ const Emulator = ({ commandRef, onUpdateIcons, onOpenFile }) => {
         emulatorInstance.serial0_send(command + "\r");
       }
     },
+    sendRaw: (str) => {
+      if (emulatorInstance) {
+        emulatorInstance.serial0_send(str);
+      }
+    }
   }));
 
   useEffect(() => {
@@ -26,53 +35,85 @@ const Emulator = ({ commandRef, onUpdateIcons, onOpenFile }) => {
     }
   }, [isLibraryLoaded]);
 
-  //VISUAL SCREEN SCRAPER
+  // VISUAL SCREEN SCRAPER
   useEffect(() => {
     const scanner = setInterval(() => {
       if (screenRef.current && screenRef.current.children[0]) {
         const screenText = screenRef.current.children[0].innerText || "";
         
-        // 1. Scrape Desktop Icons
-        if (screenText.includes("[GUI]")) {
-          const lines = screenText.split('\n');
-          lines.forEach(line => {
-            if (line.includes("[GUI]")) {
-              const filename = line.substring(line.indexOf("[GUI]") + 5).trim();
-              if (filename && !processedFilesRef.current.has(filename)) {
-                processedFilesRef.current.add(filename);
-                if (onUpdateIcons) onUpdateIcons(filename);
-              }
+        // --- 1. ATOMIC GUI SCRAPER ---
+        const currentGuiCount = (screenText.match(/\[GUI_END\]/g) || []).length;
+        
+        // Failsafe: If the terminal was cleared, reset our counter
+        if (currentGuiCount < guiCountRef.current) guiCountRef.current = 0;
+
+        if (currentGuiCount > guiCountRef.current) {
+            guiCountRef.current = currentGuiCount;
+
+            const lastStart = screenText.lastIndexOf("[GUI_START]");
+            const lastEnd = screenText.lastIndexOf("[GUI_END]");
+            
+            if (lastStart > -1 && lastEnd > lastStart) {
+                const block = screenText.substring(lastStart, lastEnd);
+                const lines = block.split('\n');
+                const parsedItems = [];
+
+                lines.forEach(line => {
+                    if (line.includes("<DIR>")) {
+                        const filename = line.split("<DIR>")[1].trim();
+                        if (filename) parsedItems.push({ name: filename, isFolder: true });
+                    } else if (line.includes("<FILE>")) {
+                        const filename = line.split("<FILE>")[1].trim();
+                        if (filename) parsedItems.push({ name: filename, isFolder: false });
+                    }
+                });
+
+                // Send the ENTIRE ARRAY at once!
+                if (onUpdateIcons) onUpdateIcons(parsedItems);
             }
-          });
         }
 
-        //scrap file contents for Notepad
-        if (screenText.includes("[READ]") && screenText.includes("[ENDREAD]")) {
-            //cnt how many times [ENDREAD] is on the screen
-            const currentReadCount = (screenText.match(/\[ENDREAD\]/g) || []).length;
-            
-            //only trigger if a NEW file was just printed!
-            if (currentReadCount > readCountRef.current) {
-                readCountRef.current = currentReadCount; // Update our memory
+        // --- 2. NOTEPAD SCRAPER ---
+        const currentReadCount = (screenText.match(/\[ENDREAD\]/g) || []).length;
+        if (currentReadCount < readCountRef.current) readCountRef.current = 0;
 
-                const lastReadIdx = screenText.lastIndexOf("[READ]") + 6;
-                const lastEndIdx = screenText.lastIndexOf("[ENDREAD]");
-                const payload = screenText.substring(lastReadIdx, lastEndIdx);
+        if (currentReadCount > readCountRef.current) {
+            readCountRef.current = currentReadCount; 
 
-                const delimiterIdx = payload.indexOf("|");
-                if (delimiterIdx > -1) {
-                    const filename = payload.substring(0, delimiterIdx).trim();
-                    const content = payload.substring(delimiterIdx + 1).trim();
+            const lastReadIdx = screenText.lastIndexOf("[READ]") + 6;
+            const lastEndIdx = screenText.lastIndexOf("[ENDREAD]");
+            const payload = screenText.substring(lastReadIdx, lastEndIdx);
 
-                    if (onOpenFile) {
-                        onOpenFile(filename, content);
-                        //emulatorInstance.serial0_send("clear\r");
-                    }
+            const delimiterIdx = payload.indexOf("|");
+            if (delimiterIdx > -1) {
+                const filename = payload.substring(0, delimiterIdx).trim();
+                const content = payload.substring(delimiterIdx + 1).trim();
+
+                if (onOpenFile) {
+                    onOpenFile(filename, content);
                 }
             }
         }
+
+        // --- 3. TICTACTOE SCRAPER ---
+        const currentTttCount = (screenText.match(/\[TTT_STATE\]/g) || []).length;
+        if (currentTttCount < tttCountRef.current) tttCountRef.current = 0;
+
+        if (currentTttCount > tttCountRef.current) {
+            tttCountRef.current = currentTttCount;
+
+            const lastStartIdx = screenText.lastIndexOf("[TTT_STATE]") + 12;
+            const lastEndIdx = screenText.lastIndexOf("[ENDTTT_STATE]");
+            if (lastStartIdx > 11 && lastEndIdx > lastStartIdx) {
+                const boardData = screenText.substring(lastStartIdx, lastEndIdx).trim();
+                if (onTicTacToeState) {
+                    onTicTacToeState(boardData);
+                }
+            }
+        }
+
       }
-    }, 1500);
+    }, 1000); // Check every 1 second
 
     return () => clearInterval(scanner);
   }, [onUpdateIcons, onOpenFile, emulatorInstance]);
@@ -83,7 +124,7 @@ const Emulator = ({ commandRef, onUpdateIcons, onOpenFile }) => {
       const V86Starter = window.V86;
       if (!V86Starter) return;
 
-      const mountDisksAndBoot = async () => {
+     const mountDisksAndBoot = async () => {
         try {
           const osRes = await fetch("/images/os.dsk?v=" + Date.now());
           const osBuffer = await osRes.arrayBuffer();
